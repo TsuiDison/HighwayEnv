@@ -27,6 +27,18 @@ class CustomRewardWrapper(gym.Wrapper):
             reward += 0.5 
         elif action == 4: # SLOWER
             reward -= 0.05
+            
+        # 3. Distance Traveled Reward
+        # Get speed from the vehicle (if available) or info
+        # highway-env usually exposes the vehicle in unwrapped env
+        try:
+            speed = self.env.unwrapped.vehicle.speed
+            # Distance = speed * dt. Default simulation frequency is 15Hz.
+            # dt = 1 / 15
+            distance_reward = speed / 15.0
+            reward += distance_reward
+        except AttributeError:
+            pass # If vehicle speed is not accessible, skip this reward
 
         return obs, reward, done, truncated, info
 
@@ -75,6 +87,6 @@ if __name__ == "__main__":
     # Train the agent
     model.learn(total_timesteps=int(2e4))
     # Save the agent
-    save_path = "highway_ppo/model_discrete"
+    save_path = "highway_ppo/model_discrete_v2"
     model.save(save_path)
     print(f"Training finished. Model saved to {save_path}.zip")

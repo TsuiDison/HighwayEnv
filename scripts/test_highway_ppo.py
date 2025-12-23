@@ -26,6 +26,14 @@ class CustomRewardWrapper(gym.Wrapper):
             reward += 0.5 
         elif action == 4: # SLOWER
             reward -= 0.05
+            
+        # 3. Distance Traveled Reward
+        try:
+            speed = self.env.unwrapped.vehicle.speed
+            distance_reward = speed / 15.0
+            reward += distance_reward
+        except AttributeError:
+            pass
 
         return obs, reward, done, truncated, info
 
@@ -46,7 +54,7 @@ if __name__ == "__main__":
     }
 
     # Path to the trained model
-    model_path = "highway_ppo/model_discrete" 
+    model_path = "highway_ppo/model_discrete_v2" 
 
     print(f"Attempting to load model from: {model_path}")
     
@@ -78,6 +86,7 @@ if __name__ == "__main__":
         obs, info = env.reset()
         done = truncated = False
         step = 0
+        total_distance = 0.0
         print(f"\nStarting Test Episode {e+1}...")
         
         while not (done or truncated):
@@ -90,6 +99,15 @@ if __name__ == "__main__":
             print(f"Step {step}: Action={action_str}")
             
             obs, reward, done, truncated, info = env.step(action)
+            
+            # Calculate distance for reporting
+            try:
+                current_speed = env.unwrapped.vehicle.speed
+                step_distance = current_speed / 15.0
+                total_distance += step_distance
+            except AttributeError:
+                pass
+
             print(f"Step {step}: Reward: {reward:.4f}, Crashed: {info.get('crashed', False)}")
             
             env.render()
@@ -99,6 +117,8 @@ if __name__ == "__main__":
             if info.get('crashed', False):
                 print("Vehicle Crashed! Episode ending.")
                 break
+        
+        print(f"Episode finished. Total Distance Traveled: {total_distance:.2f} m")
     
     env.close()
     print("Testing finished.")
