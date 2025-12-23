@@ -4,6 +4,7 @@ from stable_baselines3.common.env_util import make_vec_env
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
 import highway_env  # noqa: F401
+import time
 
 
 # ==================================
@@ -34,11 +35,16 @@ if __name__ == "__main__":
         model.save("highway_ppo/model")
 
     model = PPO.load("highway_ppo/model")
-    env = gym.make("highway-fast-v0")
+    env = gym.make("highway-fast-v0", render_mode="rgb_array")
     for _ in range(5):
         obs, info = env.reset()
         done = truncated = False
+        step = 0
         while not (done or truncated):
             action, _ = model.predict(obs)
+            print(f"Step {step}: Action taken: {action}")
             obs, reward, done, truncated, info = env.step(action)
+            print(f"Step {step}: New observation shape: {obs.shape}, Reward: {reward}")
             env.render()
+            time.sleep(0.2)
+            step += 1
