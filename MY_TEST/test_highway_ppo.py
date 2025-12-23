@@ -50,12 +50,17 @@ if __name__ == "__main__":
             "longitudinal": True,
             "lateral": True,
         },
-        "duration": 40,
+        "duration": 1000000000000000000,
         "collision_reward": -5.0,
     }
 
     # Path to the trained model
-    model_path = "highway_ppo/model_discrete_v2" 
+    # Assuming script is run from MY_TEST folder, and model is in ../highway_ppo/
+    model_path = "../highway_ppo/model_discrete_v2" 
+    
+    # Fallback if running from root
+    if not os.path.exists(model_path + ".zip") and os.path.exists("highway_ppo/model_discrete_v2.zip"):
+        model_path = "highway_ppo/model_discrete_v2"
 
     print(f"Attempting to load model from: {model_path}")
     
@@ -72,17 +77,8 @@ if __name__ == "__main__":
     env = gym.make("highway-fast-v0", render_mode="rgb_array", config=env_config)
     env = CustomRewardWrapper(env)
     
-    # Action map for printing
-    ACTION_MAP = {
-        0: 'LANE_LEFT',
-        1: 'IDLE',
-        2: 'LANE_RIGHT',
-        3: 'FASTER',
-        4: 'SLOWER'
-    }
-
-    # Run 10 episodes for evaluation
-    episodes = 10
+    # Run 1000 episodes for evaluation
+    episodes = 1000
     rewards_list = []
     distances_list = []
     
@@ -123,24 +119,62 @@ if __name__ == "__main__":
     env.close()
     print("Evaluation finished.")
     
+    # Export results to txt
+    results = list(zip(rewards_list, distances_list))
+    # Sort by distance (index 1), descending
+    results.sort(key=lambda x: x[1], reverse=True)
+    
+    txt_output_file = 'evaluation_data.txt'
+    with open(txt_output_file, 'w') as f:
+        f.write("Rank\tTotal Reward\tTotal Distance (m)\n")
+        for i, (r, d) in enumerate(results):
+            f.write(f"{i+1}\t{r:.2f}\t{d:.2f}\n")
+    print(f"Data saved to '{txt_output_file}' (Sorted by Distance)")
+    
     # Plotting results
     try:
+        from scipy.stats import gaussian_kde
         plt.figure(figsize=(12, 5))
-
+        
         # Reward Distribution
         plt.subplot(1, 2, 1)
-        plt.hist(rewards_list, bins=10, color='skyblue', edgecolor='black')
-        plt.title('Reward Distribution')
+        if len(rewards_list) > 1:
+            # KDE (Continuous Probability Density)
+            try:
+                kde = gaussian_kde(rewards_list)
+                r_min, r_max = min(rewards_list), max(rewards_list)
+                # Extend range slightly for better visualization
+                x_grid = np.linspace(r_min - 5, r_max + 5, 500)
+                y_grid = kde(x_grid)
+                plt.plot(x_grid, y_grid, color='blue', linewidth=2, label='KDE (Density)')
+                plt.fill_between(x_grid, y_grid, color='blue', alpha=0.3) # Fill under curve
+            except Exception as kde_err:
+                print(f"KDE Error (Reward): {kde_err}")
+        
+        plt.title('Reward Probability Density')
         plt.xlabel('Total Reward')
-        plt.ylabel('Frequency')
+        plt.ylabel('Density')
+        plt.legend()
         plt.grid(axis='y', alpha=0.75)
 
         # Distance Distribution
         plt.subplot(1, 2, 2)
-        plt.hist(distances_list, bins=10, color='lightgreen', edgecolor='black')
-        plt.title('Distance Traveled Distribution')
+        if len(distances_list) > 1:
+            # KDE (Continuous Probability Density)
+            try:
+                kde = gaussian_kde(distances_list)
+                d_min, d_max = min(distances_list), max(distances_list)
+                x_grid = np.linspace(d_min - 5, d_max + 5, 500)
+                y_grid = kde(x_grid)
+                plt.plot(x_grid, y_grid, color='green', linewidth=2, label='KDE (Density)')
+                plt.fill_between(x_grid, y_grid, color='green', alpha=0.3) # Fill under curve
+            except Exception as kde_err:
+                print(f"KDE Error (Distance): {kde_err}")
+
+        plt.title('Distance Probability Density')
         plt.xlabel('Distance (m)')
-        plt.ylabel('Frequency')
+        plt.ylabel('Density')
+        plt.legend()
         plt.grid(axis='y', alpha=0.75)
 
         plt.tight_layout()
@@ -148,5 +182,7 @@ if __name__ == "__main__":
         plt.savefig(output_file)
         print(f"Plots saved to '{output_file}'")
         # plt.show() # Optional: show if supported
+    except ImportError:
+        print("Error: scipy is required for KDE plots. Please install it using 'pip install scipy'.")
     except Exception as e:
         print(f"Error plotting results: {e}")
