@@ -68,6 +68,8 @@ class GRPOTrainer:
         os.makedirs(save_dir, exist_ok=True)
         writer = SummaryWriter(log_dir=os.path.join(save_dir, "logs_v2"))
         global_step = 0
+        last_print_step = 0
+        rollout_log_interval = 512
         
         while curr_steps < total_timesteps:
             obs = self.env.reset()
@@ -76,11 +78,13 @@ class GRPOTrainer:
             # 记录业务指标
             episode_speeds = []
             crash_count = 0
+            rollout_reward_sum = 0.0
+            rollout_reward_count = 0
             dt = 1 / 5 # policy_frequency 是 5Hz，所以每步是 0.2 秒
             
             # --- Rollout Phase ---
             episode_distances = {env_id: 0.0 for env_id in range(self.env.num_envs)}
-            for _ in range(rollout_steps):
+            for rollout_idx in range(rollout_steps):
                 action, log_prob = self.select_action(obs)
                 next_obs, reward, done, info = self.env.step(action)
                 
@@ -88,6 +92,8 @@ class GRPOTrainer:
                 all_actions.append(action)
                 all_log_probs.append(log_prob)
                 all_rewards.append(reward)
+                rollout_reward_sum += float(np.mean(reward))
+                rollout_reward_count += 1
                 # 统计数据
                 for env_id, env_info in enumerate(info):
                     episode_speeds.append(env_info.get("speed", 0))
@@ -97,6 +103,17 @@ class GRPOTrainer:
                 
                 obs = next_obs
                 curr_steps += self.env.num_envs
+                if (rollout_idx + 1) % rollout_log_interval == 0:
+                    mean_step_reward = (
+                        rollout_reward_sum / rollout_reward_count
+                        if rollout_reward_count > 0
+                        else 0.0
+                    )
+                    print(
+                        f"[rollout] step {rollout_idx + 1}/{rollout_steps} | "
+                        f"total_steps {curr_steps}/{total_timesteps} | "
+                        f"mean_step_reward {mean_step_reward:.2f}"
+                    )
             
             # --- GRPO Logic: Group Relative Advantage ---
             # rewards shape: [rollout_steps, n_envs]
@@ -141,16 +158,23 @@ class GRPOTrainer:
             writer.add_scalar("env/crash_rate", crash_count / (rollout_steps * self.env.num_envs), global_step)
             writer.add_scalar("train/loss", loss.item(), global_step)
             writer.add_scalar("train/entropy", entropy.item(), global_step)
-            writer.add_scalar("env/mean_distance", np.mean(episode_distances), global_step)
+            mean_distance = float(np.mean(list(episode_distances.values())))
+            writer.add_scalar("env/mean_distance", mean_distance, global_step)
             # 记录所有并行环境里跑得最远的那辆车是多少米
-            writer.add_scalar("env/max_distance", np.max(episode_distances), global_step)
+            writer.add_scalar("env/max_distance", float(np.max(list(episode_distances.values()))), global_step)
             
             # 记录动作分布情况
             for a in range(5):
                 act_perc = (action_tensor == a).float().mean().item()
                 writer.add_scalar(f"actions/act_{a}", act_perc, global_step)
 
-            print(f"Steps: {curr_steps}/{total_timesteps} | Ret: {mean_ret:.2f} | Speed: {np.mean(episode_speeds):.2f}")
+            if curr_steps - last_print_step >= 1000:
+                print(
+                    f"Steps: {curr_steps}/{total_timesteps} | "
+                    f"Ret: {mean_ret:.2f} | Speed: {np.mean(episode_speeds):.2f} | "
+                    f"Dist: {mean_distance:.2f} | CrashRate: {crash_count / (rollout_steps * self.env.num_envs):.3f}"
+                )
+                last_print_step = curr_steps
             global_step += 1
 
         writer.close()
