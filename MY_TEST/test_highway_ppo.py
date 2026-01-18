@@ -4,7 +4,10 @@ import highway_env  # noqa: F401
 import time
 import numpy as np
 import os
+import argparse
+import glob
 import matplotlib.pyplot as plt
+from gymnasium.wrappers import RecordVideo
 
 # ==================================
 #        Custom Wrapper
@@ -43,146 +46,165 @@ class CustomRewardWrapper(gym.Wrapper):
 # ==================================
 
 if __name__ == "__main__":
-    # Define the custom configuration
-    env_config = {
+    # Parse arguments
+    parser = argparse.ArgumentParser(description="Test trained Highway PPO agent")
+    parser.add_argument("--run_id", type=int, default=None, help="The run ID to load (e.g., 1). Default: Latest run in the scenario folder.")
+    parser.add_argument("--scenario", type=int, default=1, choices=[1, 2, 3], 
+                        help="1: Highway/Merge (Distance), 2: Roundabout (Time), 3: Parking (Time)")
+    args = parser.parse_args()
+
+    # Define the custom configuration (only used for Discrete envs 1 & 2)
+    common_config = {
         "action": {
             "type": "DiscreteMetaAction",
             "longitudinal": True,
             "lateral": True,
         },
-        "duration": 1000000000000000000,
+        "duration": 60, # Longer duration for testing
         "collision_reward": -5.0,
     }
 
-    # Path to the trained model
-    # Assuming script is run from MY_TEST folder, and model is in ../highway_ppo/
-    model_path = "../highway_ppo/model_discrete_v2" 
-    
-    # Fallback if running from root
-    if not os.path.exists(model_path + ".zip") and os.path.exists("highway_ppo/model_discrete_v2.zip"):
-        model_path = "highway_ppo/model_discrete_v2"
+    # Map scenario to folder name
+    scenario_names = {1: "highway_merge", 2: "roundabout", 3: "parking"}
+    scenario_name = scenario_names[args.scenario]
 
-    print(f"Attempting to load model from: {model_path}")
+    # Locate the model directory
+    script_dir = os.path.dirname(os.path.abspath(__file__))
+    base_dir = os.path.join(script_dir, "highway_ppo", scenario_name)
+
+    model_path = None
     
-    if not os.path.exists(model_path + ".zip"):
-        print(f"Error: Model file '{model_path}.zip' not found.")
-        print("Please run the training script first.")
+    if args.run_id is not None:
+        # Load specific run
+        run_path = os.path.join(base_dir, f"run_{args.run_id}")
+        model_candidate = os.path.join(run_path, "model")
+        if os.path.exists(model_candidate + ".zip"):
+             model_path = model_candidate
+        else:
+             print(f"Warning: Model not found at {model_candidate}.zip")
+    else:
+        # Find latest run
+        if os.path.exists(base_dir):
+            existing_runs = glob.glob(os.path.join(base_dir, "run_*"))
+            if existing_runs:
+                def get_run_id(path):
+                    try:
+                        return int(os.path.basename(path).split("_")[-1])
+                    except ValueError:
+                        return -1
+                latest_run = max(existing_runs, key=get_run_id)
+                model_path = os.path.join(latest_run, "model")
+                print(f"No run_id provided. Loading latest run for '{scenario_name}': {os.path.basename(latest_run)}")
+        
+        if model_path is None:
+             print(f"No runs found in {base_dir}")
+    
+    if model_path is None or not os.path.exists(model_path + ".zip"):
+        print(f"Error: Model not found.")
         exit(1)
+
+    print(f"Loading model from: {model_path}")
 
     # Load the trained model
     model = PPO.load(model_path)
     print("Model loaded successfully.")
     
-    # Create single environment for testing
-    env = gym.make("highway-fast-v0", render_mode="rgb_array", config=env_config)
-    env = CustomRewardWrapper(env)
+    # Create environment for testing
+    env_id = "highway-fast-v0" # Default
+    if args.scenario == 1:
+        # Test on Merge as requested "Merge and Highway together"
+        # We can test on highway or merge. Let's ask user or default to one.
+        # Let's test on merge-v0 as it's harder/representative
+        env_id = "merge-v0" 
+        print("Testing on 'merge-v0' (Part of Scenario 1)")
+    elif args.scenario == 2:
+        env_id = "roundabout-v0"
+        print("Testing on 'roundabout-v0'")
+    elif args.scenario == 3:
+        env_id = "parking-v0"
+        print("Testing on 'parking-v0'")
     
-    # Run 1000 episodes for evaluation
-    episodes = 1000
-    rewards_list = []
-    distances_list = []
+    if args.scenario == 3:
+        env = gym.make(env_id, render_mode="rgb_array")
+    else:
+        env = gym.make(env_id, render_mode="rgb_array", config=common_config)
+        env = CustomRewardWrapper(env)
+        
+    env = RecordVideo(env, video_folder=os.path.dirname(model_path), episode_trigger=lambda x: True, name_prefix=f"test_{scenario_name}")
     
+    # Run 10 episodes for evaluation
+    episodes = 5
+    # total_reward += reward # Deprecated in new loop structure
+
     print(f"Starting evaluation for {episodes} episodes...")
 
     for e in range(episodes):
         obs, info = env.reset()
         done = truncated = False
-        total_reward = 0.0
+        steps = 0
         total_distance = 0.0
+        crashed = False
+        success = False
         
         while not (done or truncated):
             action, _ = model.predict(obs)
-            
             obs, reward, done, truncated, info = env.step(action)
+            steps += 1
             
-            total_reward += reward
+            # Track distance for highway
+            if args.scenario == 1:
+                try:
+                    speed = env.unwrapped.vehicle.speed
+                    total_distance += speed / 15.0
+                except: pass
             
-            # Calculate distance for reporting
-            try:
-                current_speed = env.unwrapped.vehicle.speed
-                step_distance = current_speed / 15.0
-                total_distance += step_distance
-            except AttributeError:
-                pass
+            # Check for success in Roundabout/Parking
+            if args.scenario == 2:
+                # Roundabout Success Criteria: Exiting the roundabout
+                # The roundabout is centered at 0. North exit is negative Y.
+                # If vehicle Y is < -20 (passed the loop), consider it a success.
+                try:
+                    vehicle = env.unwrapped.vehicle
+                    if vehicle.position[1] < -20: 
+                        success = True
+                        # Optional: Stop early if successful to measure time accurately
+                        # done = True 
+                        break 
+                except: pass
+            
+            elif args.scenario == 3:
+                # Parking Success Criteria: info['is_success']
+                if info.get('is_success', False):
+                    success = True
+                    break
 
-            # env.render() # Commented out for faster evaluation
-            # time.sleep(0.5) # Removed delay
-            
             if info.get('crashed', False):
-                # print("Vehicle Crashed!") # Optional: reduce noise
-                break
+                crashed = True
+                break # Stop immediately on crash as per requirement
         
-        rewards_list.append(total_reward)
-        distances_list.append(total_distance)
-        print(f"Episode {e+1}: Total Reward: {total_reward:.2f}, Total Distance: {total_distance:.2f} m, Crashed: {info.get('crashed', False)}")
-    
-    env.close()
-    print("Evaluation finished.")
-    
-    # Export results to txt
-    results = list(zip(rewards_list, distances_list))
-    # Sort by distance (index 1), descending
-    results.sort(key=lambda x: x[1], reverse=True)
-    
-    txt_output_file = 'evaluation_data.txt'
-    with open(txt_output_file, 'w') as f:
-        f.write("Rank\tTotal Reward\tTotal Distance (m)\n")
-        for i, (r, d) in enumerate(results):
-            f.write(f"{i+1}\t{r:.2f}\t{d:.2f}\n")
-    print(f"Data saved to '{txt_output_file}' (Sorted by Distance)")
-    
-    # Plotting results
-    try:
-        from scipy.stats import gaussian_kde
-        plt.figure(figsize=(12, 5))
+        # Result Evaluation
+        time_taken = steps / 15.0 # dt = 1/15 s
         
-        # Reward Distribution
-        plt.subplot(1, 2, 1)
-        if len(rewards_list) > 1:
-            # KDE (Continuous Probability Density)
-            try:
-                kde = gaussian_kde(rewards_list)
-                r_min, r_max = min(rewards_list), max(rewards_list)
-                # Extend range slightly for better visualization
-                x_grid = np.linspace(r_min - 5, r_max + 5, 500)
-                y_grid = kde(x_grid)
-                plt.plot(x_grid, y_grid, color='blue', linewidth=2, label='KDE (Density)')
-                plt.fill_between(x_grid, y_grid, color='blue', alpha=0.3) # Fill under curve
-            except Exception as kde_err:
-                print(f"KDE Error (Reward): {kde_err}")
-        
-        plt.title('Reward Probability Density')
-        plt.xlabel('Total Reward')
-        plt.ylabel('Density')
-        plt.legend()
-        plt.grid(axis='y', alpha=0.75)
-
-        # Distance Distribution
-        plt.subplot(1, 2, 2)
-        if len(distances_list) > 1:
-            # KDE (Continuous Probability Density)
-            try:
-                kde = gaussian_kde(distances_list)
-                d_min, d_max = min(distances_list), max(distances_list)
-                x_grid = np.linspace(d_min - 5, d_max + 5, 500)
-                y_grid = kde(x_grid)
-                plt.plot(x_grid, y_grid, color='green', linewidth=2, label='KDE (Density)')
-                plt.fill_between(x_grid, y_grid, color='green', alpha=0.3) # Fill under curve
-            except Exception as kde_err:
-                print(f"KDE Error (Distance): {kde_err}")
-
-        plt.title('Distance Probability Density')
-        plt.xlabel('Distance (m)')
-        plt.ylabel('Density')
-        plt.legend()
-        plt.grid(axis='y', alpha=0.75)
-
-        plt.tight_layout()
-        output_file = 'evaluation_results.png'
-        plt.savefig(output_file)
-        print(f"Plots saved to '{output_file}'")
-        # plt.show() # Optional: show if supported
-    except ImportError:
-        print("Error: scipy is required for KDE plots. Please install it using 'pip install scipy'.")
-    except Exception as e:
-        print(f"Error plotting results: {e}")
+        if args.scenario == 1:
+            # Highway/Merge: Maximize Distance, Crash = Fail
+            result_str = "FAILED (Crash)" if crashed else f"Distance: {total_distance:.2f} m"
+            print(f"Episode {e+1}: {result_str}")
+            
+        elif args.scenario == 2:
+            # Roundabout: Minimize Time, Crash = Fail
+            if crashed:
+                 print(f"Episode {e+1}: FAILED (Crash)")
+            elif success:
+                 print(f"Episode {e+1}: SUCCESS - Time: {time_taken:.2f} s")
+            else:
+                 # Timed out and didn't pass
+                 print(f"Episode {e+1}: FAILED (Timeout - Did not pass)")
+                 
+        elif args.scenario == 3:
+            # Parking: Minimize Time, Crash = Fail
+            if crashed:
+                 print(f"Episode {e+1}: FAILED (Crash)")
+            elif success:
+                 print(f"Episode {e+1}: SUCCESS - Time: {time_taken:.2f} s")
+            else:
+                 print(f"Episode {e+1}: FAILED (Timeout - Did not park)")
