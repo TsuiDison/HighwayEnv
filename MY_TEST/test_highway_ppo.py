@@ -13,32 +13,132 @@ from gymnasium.wrappers import RecordVideo
 #        Custom Wrapper
 # ==================================
 class CustomRewardWrapper(gym.Wrapper):
+    """改进的离散动作环境奖励包装器"""
     def __init__(self, env):
         super().__init__(env)
+        self.last_action = None
+        self.last_speed = 0.0
+        self.speed_history = []
+        self.max_history = 5
     
     def step(self, action):
         obs, reward, done, truncated, info = self.env.step(action)
         
         # Action is discrete: 0: LANE_LEFT, 1: IDLE, 2: LANE_RIGHT, 3: FASTER, 4: SLOWER
         
-        # 1. Increase Collision Penalty
+        # 1. Collision Penalty - Strong penalty to discourage crashes
         if info.get('crashed', False):
-             reward -= 5.0 
+            reward -= 10.0
         
-        # 2. Acceleration Reward / Deceleration Penalty (Discrete approximation)
-        if action == 3: # FASTER
-            reward += 0.5 
-        elif action == 4: # SLOWER
-            reward -= 0.05
-            
-        # 3. Distance Traveled Reward
+        # 2. Get current speed for analysis
         try:
             speed = self.env.unwrapped.vehicle.speed
-            distance_reward = speed / 15.0
-            reward += distance_reward
+            self.speed_history.append(speed)
+            if len(self.speed_history) > self.max_history:
+                self.speed_history.pop(0)
+            speed_variance = np.var(self.speed_history) if len(self.speed_history) > 1 else 0
         except AttributeError:
-            pass
+            speed = 0.0
+            speed_variance = 0.0
+        
+        # 3. Smooth Action Encouragement with speed constraints
+        if action == 1:  # IDLE
+            reward += 0.3
+        elif action == 3:  # FASTER
+            reward += 0.1
+            if speed > 28.0:
+                reward -= 0.3
+        elif action == 4:  # SLOWER
+            reward += 0.1
+        
+        # Penalize abrupt action changes
+        if self.last_action is not None:
+            if (self.last_action == 3 and action == 4) or \
+               (self.last_action == 4 and action == 3):
+                reward -= 0.2
+            
+        # 4. Speed variance penalty
+        if speed_variance > 0.5:
+            reward -= speed_variance * 0.05
+        
+        # 5. Ideal speed reward
+        if speed > 22:
+            ideal_low, ideal_high = 25.0, 30.0
+        else:
+            ideal_low, ideal_high = 15.0, 25.0
+        
+        if ideal_low <= speed <= ideal_high:
+            reward += 0.2
+        else:
+            speed_diff = min(abs(speed - ideal_low), abs(speed - ideal_high))
+            reward -= speed_diff * 0.02
+        
+        self.last_action = action
+        self.last_speed = speed
+        return obs, reward, done, truncated, info
 
+
+class ParkingRewardWrapper(gym.Wrapper):
+    """针对停车场景的连续动作环境奖励优化"""
+    def __init__(self, env):
+        super().__init__(env)
+        self.prev_distance_to_goal = None
+        self.episode_step = 0
+    
+    def reset(self, **kwargs):
+        self.prev_distance_to_goal = None
+        self.episode_step = 0
+        return self.env.reset(**kwargs)
+    
+    def step(self, action):
+        obs, reward, done, truncated, info = self.env.step(action)
+        self.episode_step += 1
+        
+        # 1. Collision penalty
+        if info.get('crashed', False):
+            reward -= 10.0
+        
+        # 2. Target distance reward
+        try:
+            if isinstance(obs, dict):
+                achieved = obs.get('achieved_goal', np.array([0, 0, 0, 0, 0, 0]))
+                desired = obs.get('desired_goal', np.array([0, 0, 0, 0, 0, 0]))
+            else:
+                achieved = obs[:6] if len(obs) >= 6 else np.array([0, 0, 0, 0, 0, 0])
+                desired = obs[6:12] if len(obs) >= 12 else np.array([0, 0, 0, 0, 0, 0])
+            
+            pos_diff = np.sqrt((achieved[0] - desired[0])**2 + (achieved[1] - desired[1])**2)
+            angle_diff = abs(achieved[4] - desired[4]) + abs(achieved[5] - desired[5])
+            distance = pos_diff + angle_diff * 0.5
+            
+            if self.prev_distance_to_goal is not None:
+                distance_improvement = self.prev_distance_to_goal - distance
+                if distance_improvement > 0:
+                    proximity_factor = max(0.5, 1.0 - distance / 10.0)
+                    reward += distance_improvement * proximity_factor * 2.0
+                else:
+                    reward -= abs(distance_improvement) * 0.5
+            
+            self.prev_distance_to_goal = distance
+            
+            if self.episode_step > 1 and self.episode_step < 100:
+                reward += 0.1
+                    
+        except (IndexError, ValueError):
+            pass
+        
+        # 3. Success reward
+        if info.get('is_success', False):
+            reward += 10.0
+        
+        # 4. Action smoothness
+        if hasattr(self, 'last_action') and self.last_action is not None:
+            action_diff = np.sqrt(np.sum((action - self.last_action)**2))
+            if action_diff > 0.5:
+                reward -= action_diff * 0.2
+        
+        self.last_action = action.copy() if isinstance(action, np.ndarray) else action
+        
         return obs, reward, done, truncated, info
 
 # ==================================
@@ -126,6 +226,7 @@ if __name__ == "__main__":
     
     if args.scenario == 3:
         env = gym.make(env_id, render_mode="rgb_array")
+        env = ParkingRewardWrapper(env)  # 使用停车专用wrapper
     else:
         env = gym.make(env_id, render_mode="rgb_array", config=common_config)
         env = CustomRewardWrapper(env)
