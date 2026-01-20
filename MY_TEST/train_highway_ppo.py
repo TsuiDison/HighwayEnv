@@ -117,48 +117,35 @@ class ParkingRewardWrapper(gym.Wrapper):
         if info.get('crashed', False):
             reward -= 10.0
         
-        # 2. 目标距离的更好奖励
+        # 2. 距离改进奖励 (Reward Shaping) - 关键改进!
         try:
-            # obs 通常是 [achieved_goal, desired_goal, observation]
-            # 对于停车: achieved_goal是当前位置, desired_goal是停车位置
             if isinstance(obs, dict):
-                achieved = obs.get('achieved_goal', np.array([0, 0, 0, 0, 0, 0]))
-                desired = obs.get('desired_goal', np.array([0, 0, 0, 0, 0, 0]))
+                achieved = obs.get('achieved_goal', np.array([0]*6))[:2]  # 仅取位置
+                desired = obs.get('desired_goal', np.array([0]*6))[:2]
             else:
-                achieved = obs[:6] if len(obs) >= 6 else np.array([0, 0, 0, 0, 0, 0])
-                desired = obs[6:12] if len(obs) >= 12 else np.array([0, 0, 0, 0, 0, 0])
+                achieved = obs[:2] if len(obs) >= 2 else np.array([0, 0])
+                desired = obs[6:8] if len(obs) >= 8 else np.array([0, 0])
             
-            # 计算距离 (位置和方向的组合距离)
-            pos_diff = np.sqrt((achieved[0] - desired[0])**2 + (achieved[1] - desired[1])**2)
-            angle_diff = abs(achieved[4] - desired[4]) + abs(achieved[5] - desired[5])
-            distance = pos_diff + angle_diff * 0.5
+            distance = np.linalg.norm(achieved - desired)
             
-            # 奖励逐步接近目标
-            if self.prev_distance_to_goal is not None:
-                distance_improvement = self.prev_distance_to_goal - distance
-                if distance_improvement > 0:
-                    # 接近目标时奖励更多
-                    proximity_factor = max(0.5, 1.0 - distance / 10.0)
-                    reward += distance_improvement * proximity_factor * 2.0
-                else:
-                    # 远离目标时轻微惩罚
-                    reward -= abs(distance_improvement) * 0.5
+            if not hasattr(self, 'prev_distance'):
+                self.prev_distance = distance
             
-            self.prev_distance_to_goal = distance
+            # 持续奖励进度 (关键!)
+            improvement = self.prev_distance - distance
+            if improvement > 0.01:  # 有实际改进
+                reward += improvement * 5.0  # 每单位改进给5点奖励
+            elif improvement < -0.01:  # 远离了
+                reward -= abs(improvement) * 2.0
             
-            # 3. 时间效率奖励 (完成得快更好，但不能太着急)
-            if self.episode_step > 1:
-                steps_taken = self.episode_step
-                # 奖励快速但平稳的完成
-                if steps_taken < 100:
-                    reward += 0.1  # 快速完成奖励
-                    
-        except (IndexError, ValueError):
+            self.prev_distance = distance
+            
+        except Exception:
             pass
         
-        # 4. 成功停车的大奖励
+        # 3. 成功停车的大奖励
         if info.get('is_success', False):
-            reward += 10.0  # 成功停车大奖励
+            reward += 20.0  # 增加到20
         
         # 5. 平稳动作约束 - 连续动作空间中限制方向变化
         if hasattr(self, 'last_action') and self.last_action is not None:
@@ -173,6 +160,21 @@ class ParkingRewardWrapper(gym.Wrapper):
 # ==================================
 #    绘制训练曲线函数
 # ==================================
+def find_events_file(run_dir):
+    """查找TensorBoard events文件，支持子目录"""
+    # 首先检查直接在run_dir中的events文件
+    events_files = glob.glob(os.path.join(run_dir, "events.out.tfevents.*"))
+    if events_files:
+        return events_files[0]
+    
+    # 如果没有找到，递归搜索子目录
+    for root, dirs, files in os.walk(run_dir):
+        for file in files:
+            if file.startswith("events.out.tfevents."):
+                return os.path.join(root, file)
+    
+    return None
+
 def plot_training_curves(run_dir, scenario_name, script_dir):
     """从TensorBoard日志绘制训练曲线"""
     try:
@@ -180,11 +182,18 @@ def plot_training_curves(run_dir, scenario_name, script_dir):
         plot_dir = script_dir
         os.makedirs(plot_dir, exist_ok=True)
         
-        # 使用EventAccumulator读取TensorBoard日志
-        event_acc = EventAccumulator(run_dir)
-        event_acc.Reload()
+        # 查找events文件
+        events_file = find_events_file(run_dir)
+        if not events_file:
+            print(f"⚠️  Warning: No TensorBoard events file found in {run_dir}")
+            return
         
         print(f"\n📊 Reading TensorBoard logs from: {run_dir}")
+        print(f"Found events file: {events_file}")
+        
+        # 使用EventAccumulator读取TensorBoard日志
+        event_acc = EventAccumulator(os.path.dirname(events_file))
+        event_acc.Reload()
         
         # 获取所有标签
         tags = event_acc.Tags()
@@ -382,8 +391,16 @@ if __name__ == "__main__":
             "collision_reward": -5.0,
         }
     else:
-        # 停车场景 - 将在make_env中单独处理
-        common_config = {}
+        # 停车场景 - 使用离散动作 (关键改进!)
+        common_config = {
+            "action": {
+                "type": "DiscreteMetaAction",  # 改为离散: 25个动作 vs 无穷连续
+                "longitudinal": True,
+                "lateral": True,
+            },
+            "duration": 50,
+            "collision_reward": -5.0,
+        }
 
     n_cpu = 6
     batch_size = 64
@@ -398,12 +415,12 @@ if __name__ == "__main__":
     ppo_params = {
         "n_steps": batch_size * 20 // n_cpu,  # 增加步长，提高稳定性
         "batch_size": batch_size,
-        "n_epochs": 25 if args.scenario == 3 else 20,  # 停车需要更多epoch
-        "learning_rate": 2e-4 if args.scenario == 3 else 3e-4,  # 停车用更低的学习率
+        "n_epochs": 50 if args.scenario == 3 else 20,  # 停车改为50 (↑2.5倍)
+        "learning_rate": 1e-4 if args.scenario == 3 else 3e-4,  # 停车改为1e-4 (↓2倍)
         "gamma": 0.99 if args.scenario == 3 else 0.95,  # 停车重视长期规划
         "gae_lambda": 0.95 if args.scenario == 3 else 0.9,  # 停车需要更好的优势估计
         "clip_range": 0.2,
-        "ent_coef": 0.005 if args.scenario == 3 else 0.01,  # 停车减少随机性
+        "ent_coef": 0.001 if args.scenario == 3 else 0.01,  # 停车改为0.001 (↓5倍)
         "vf_coef": 0.5,
     }
     
@@ -460,7 +477,7 @@ if __name__ == "__main__":
     # 根据场景调整网络大小
     if args.scenario == 3:  # 停车需要更大的网络
         net_arch = dict(pi=[512, 512, 256], vf=[512, 512, 256])
-        train_timesteps = 500000  # 停车需要更多训练步数
+        train_timesteps = 20000  # 停车改为2M (从500K改为4倍)
     elif args.scenario == 1:  # 高速驾驶
         net_arch = dict(pi=[384, 256], vf=[384, 256])
         train_timesteps = 300000  # 增加到300K

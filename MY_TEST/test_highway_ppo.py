@@ -164,6 +164,18 @@ if __name__ == "__main__":
         "collision_reward": -5.0,
     }
 
+    # Adjust config for scenario 1 to allow longer episodes until crash
+    config = common_config
+    if args.scenario == 1:
+        config = config.copy()
+        config["duration"] = 1000  # Extend duration for merge scenario to run until crash
+        config["offroad_terminal"] = False  # Disable offroad termination, only stop on crash
+        config["goal"] = None  # Disable goal termination, only stop on crash
+        config["lanes_length"] = 100000  # Make the road much longer for infinite appearance
+        config["vehicles_count"] = 100  # Increase number of vehicles for more dynamic traffic
+        config["screen_width"] = 10000  # Increase screen width for wider view
+        config["offscreen_rendering"] = True  # Enable offscreen rendering to avoid window size issues
+
     # Map scenario to folder name
     scenario_names = {1: "highway_merge", 2: "roundabout", 3: "parking"}
     scenario_name = scenario_names[args.scenario]
@@ -228,10 +240,18 @@ if __name__ == "__main__":
         env = gym.make(env_id, render_mode="rgb_array")
         env = ParkingRewardWrapper(env)  # 使用停车专用wrapper
     else:
-        env = gym.make(env_id, render_mode="rgb_array", config=common_config)
+        env = gym.make(env_id, render_mode="rgb_array", config=config)
         env = CustomRewardWrapper(env)
         
-    env = RecordVideo(env, video_folder=os.path.dirname(model_path), episode_trigger=lambda x: True, name_prefix=f"test_{scenario_name}")
+        # For scenario 1, disable goal to prevent early termination
+        if args.scenario == 1:
+            env.unwrapped.goal = None
+        
+    # Create video directory if it doesn't exist
+    video_dir = os.path.join(script_dir, "video")
+    os.makedirs(video_dir, exist_ok=True)
+    
+    env = RecordVideo(env, video_folder=video_dir, episode_trigger=lambda x: True, name_prefix=f"test_{scenario_name}")
     
     # Run 10 episodes for evaluation
     episodes = 5
@@ -247,41 +267,59 @@ if __name__ == "__main__":
         crashed = False
         success = False
         
-        while not (done or truncated):
-            action, _ = model.predict(obs)
-            obs, reward, done, truncated, info = env.step(action)
-            steps += 1
-            
-            # Track distance for highway
-            if args.scenario == 1:
+        if args.scenario == 1:
+            # For merge scenario, run until crash or max steps, ignoring other terminations
+            while steps < 1000 and not crashed:
+                action, _ = model.predict(obs)
+                obs, reward, done, truncated, info = env.step(action)
+                steps += 1
+                
+                # Track distance for highway
                 try:
                     speed = env.unwrapped.vehicle.speed
                     total_distance += speed / 15.0
                 except: pass
-            
-            # Check for success in Roundabout/Parking
-            if args.scenario == 2:
-                # Roundabout Success Criteria: Exiting the roundabout
-                # The roundabout is centered at 0. North exit is negative Y.
-                # If vehicle Y is < -20 (passed the loop), consider it a success.
-                try:
-                    vehicle = env.unwrapped.vehicle
-                    if vehicle.position[1] < -20: 
-                        success = True
-                        # Optional: Stop early if successful to measure time accurately
-                        # done = True 
-                        break 
-                except: pass
-            
-            elif args.scenario == 3:
-                # Parking Success Criteria: info['is_success']
-                if info.get('is_success', False):
-                    success = True
+                
+                if info.get('crashed', False):
+                    crashed = True
                     break
+        else:
+            # For other scenarios, use standard termination
+            while not (done or truncated):
+                action, _ = model.predict(obs)
+                obs, reward, done, truncated, info = env.step(action)
+                steps += 1
+                
+                # Track distance for highway
+                if args.scenario == 1:
+                    try:
+                        speed = env.unwrapped.vehicle.speed
+                        total_distance += speed / 15.0
+                    except: pass
+                
+                # Check for success in Roundabout/Parking
+                if args.scenario == 2:
+                    # Roundabout Success Criteria: Exiting the roundabout
+                    # The roundabout is centered at 0. North exit is negative Y.
+                    # If vehicle Y is < -20 (passed the loop), consider it a success.
+                    try:
+                        vehicle = env.unwrapped.vehicle
+                        if vehicle.position[1] < -20: 
+                            success = True
+                            # Optional: Stop early if successful to measure time accurately
+                            # done = True 
+                            break 
+                    except: pass
+                
+                elif args.scenario == 3:
+                    # Parking Success Criteria: info['is_success']
+                    if info.get('is_success', False):
+                        success = True
+                        break
 
-            if info.get('crashed', False):
-                crashed = True
-                break # Stop immediately on crash as per requirement
+                if info.get('crashed', False):
+                    crashed = True
+                    break # Stop immediately on crash as per requirement
         
         # Result Evaluation
         time_taken = steps / 15.0 # dt = 1/15 s

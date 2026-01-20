@@ -11,6 +11,21 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 from scipy.ndimage import uniform_filter1d
 import argparse
 
+def find_events_file(run_dir):
+    """查找TensorBoard events文件，支持子目录"""
+    # 首先检查直接在run_dir中的events文件
+    events_files = glob.glob(os.path.join(run_dir, "events.out.tfevents.*"))
+    if events_files:
+        return events_files[0]
+    
+    # 如果没有找到，递归搜索子目录
+    for root, dirs, files in os.walk(run_dir):
+        for file in files:
+            if file.startswith("events.out.tfevents."):
+                return os.path.join(root, file)
+    
+    return None
+
 def plot_training_curves(run_dir, scenario_name, output_dir):
     """从TensorBoard日志绘制训练曲线"""
     try:
@@ -19,13 +34,25 @@ def plot_training_curves(run_dir, scenario_name, output_dir):
         # 创建输出目录
         os.makedirs(output_dir, exist_ok=True)
         
+        # 查找events文件
+        events_file = find_events_file(run_dir)
+        if not events_file:
+            print(f"⚠️  Warning: No TensorBoard events file found in {run_dir}")
+            return 0
+        
+        print(f"Found events file: {events_file}")
+        
         # 使用EventAccumulator读取TensorBoard日志
-        event_acc = EventAccumulator(run_dir)
+        event_acc = EventAccumulator(os.path.dirname(events_file))
         event_acc.Reload()
         
         # 获取标量数据
-        scalars = event_acc.Tags()['scalars']
-        
+        tags = event_acc.Tags()
+        if 'scalars' not in tags or not tags['scalars']:
+            print(f"⚠️  Warning: No scalar data found in {events_file}")
+            return 0
+            
+        scalars = tags['scalars']
         print(f"Available metrics: {scalars}")
         
         # 创建子图

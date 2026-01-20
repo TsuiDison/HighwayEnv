@@ -74,8 +74,8 @@ class MergeEnv(AbstractEnv):
         }
 
     def _is_terminated(self) -> bool:
-        """The episode is over when a collision occurs or when the access ramp has been passed."""
-        return self.vehicle.crashed or bool(self.vehicle.position[0] > 370)
+        """The episode is over when a collision occurs."""
+        return self.vehicle.crashed
 
     def _is_truncated(self) -> bool:
         return False
@@ -93,7 +93,8 @@ class MergeEnv(AbstractEnv):
         net = RoadNetwork()
 
         # Highway lanes
-        ends = [150, 80, 80, 150]  # Before, converging, merge, after
+        lane_length = self.config.get("lanes_length", 460)
+        ends = [lane_length // 4, 80, 80, lane_length // 4]  # Before, converging, merge, after
         c, s, n = LineType.CONTINUOUS_LINE, LineType.STRIPED, LineType.NONE
         y = [0, StraightLane.DEFAULT_WIDTH]
         line_type = [[c, s], [n, c]]
@@ -151,6 +152,45 @@ class MergeEnv(AbstractEnv):
         )
         road.objects.append(Obstacle(road, lbc.position(ends[2], 0)))
         self.road = road
+        
+        # Make lanes infinite for rendering
+        for lane in net.lanes:
+            lane._length = 100000
+
+    def _clear_vehicles(self):
+        """Clear vehicles that are too far away and add new ones ahead."""
+        # Remove vehicles behind
+        for vehicle in self.road.vehicles[:]:
+            if vehicle.position[0] < self.vehicle.position[0] - 3000:  # Behind by 3000m
+                self.road.vehicles.remove(vehicle)
+        
+        # Add new vehicles ahead if needed
+        while len(self.road.vehicles) < 30:
+            lane = self.road.network.get_lane(("a", "b", self.np_random.integers(2)))
+            position_x = self.vehicle.position[0] + self.np_random.uniform(50, 150)
+            position = [position_x, lane.position(0, 0)[1]]
+            speed = self.np_random.uniform(20, 35)
+            other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+            new_vehicle = other_vehicles_type(self.road, position, speed=speed)
+            new_vehicle.randomize_behavior()
+            self.road.vehicles.append(new_vehicle)
+
+    def step(self, action):
+        obs, reward, done, truncated, info = super().step(action)
+        
+        # Clear and add vehicles
+        self._clear_vehicles()
+        
+        # Add dynamic merging vehicles periodically
+        if self.steps % 100 == 0 and len(self.road.vehicles) < 30:  # Every 100 steps, if less than 30 vehicles
+            other_vehicles_type = utils.class_from_path(self.config["other_vehicles_type"])
+            merging_v = other_vehicles_type(
+                self.road, self.road.network.get_lane(("j", "k", 0)).position(110.0, 0.0), speed=20.0
+            )
+            merging_v.target_speed = 30.0
+            self.road.vehicles.append(merging_v)
+        
+        return obs, reward, done, truncated, info
 
     def _make_vehicles(self) -> None:
         """
@@ -177,4 +217,15 @@ class MergeEnv(AbstractEnv):
         )
         merging_v.target_speed = 30.0
         road.vehicles.append(merging_v)
+        
+        # Add more vehicles for denser traffic
+        for _ in range(20):
+            lane = road.network.get_lane(("a", "b", self.np_random.integers(2)))
+            pos = self.np_random.uniform(0, 200)
+            position = lane.position(pos, 0.0)
+            speed = self.np_random.uniform(20, 35)
+            vehicle = other_vehicles_type(road, position, speed=speed)
+            vehicle.randomize_behavior()
+            road.vehicles.append(vehicle)
+        
         self.vehicle = ego_vehicle
